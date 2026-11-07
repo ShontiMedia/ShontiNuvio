@@ -1,0 +1,886 @@
+package com.nuvio.tv.ui.screens.player
+
+import android.content.Context
+import android.util.Log
+import android.widget.Toast
+import androidx.media3.common.C
+import androidx.media3.common.MimeTypes
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.extractor.ExtractorsFactory
+import com.nuvio.tv.R
+import com.nuvio.tv.domain.model.Subtitle
+import com.nuvio.tv.ui.screens.player.autosync.AutoSyncAnalysisOutcome
+import com.nuvio.tv.ui.screens.player.autosync.AutoSyncCandidateScope
+import com.nuvio.tv.ui.screens.player.autosync.AutoSyncDebugLog
+import com.nuvio.tv.ui.screens.player.autosync.AutoSyncExtractorsFactory
+import com.nuvio.tv.ui.screens.player.autosync.AutoSyncLibassSubtitles
+import com.nuvio.tv.ui.screens.player.autosync.AutoSyncPreferences
+import com.nuvio.tv.ui.screens.player.autosync.AutoSyncResolvedTimeline
+import com.nuvio.tv.ui.screens.player.autosync.AutoSyncSubtitleCandidate
+import com.nuvio.tv.ui.screens.player.autosync.AutoSyncSubtitleTextRetimer
+import com.nuvio.tv.ui.screens.player.autosync.AutoSyncSyncedSubtitle
+import com.nuvio.tv.ui.screens.player.autosync.AutomaticSubtitleSync
+import com.nuvio.tv.ui.screens.player.autosync.EmbeddedSubtitleTimelineLoader
+import com.nuvio.tv.ui.screens.player.autosync.SubtitleLanguageMatching
+import com.nuvio.tv.ui.screens.player.autosync.applyAutoSyncSidecarTimeline
+import com.nuvio.tv.ui.screens.player.autosync.bubble.AutoSyncBubbleKind
+import com.nuvio.tv.ui.screens.player.autosync.bubble.AutoSyncBubbleToasts
+import com.nuvio.tv.ui.screens.player.autosync.bubble.showAutoSyncMessage
+import com.nuvio.tv.ui.screens.player.autosync.maxAlignmentShiftMs
+import com.nuvio.tv.ui.screens.player.autosync.replaceAutoSyncSidecarSubtitle
+import com.nuvio.tv.ui.screens.player.autosync.secondaryLanguageSearchSeed
+import com.nuvio.tv.ui.screens.player.audiosync.AudioSyncFallback
+import com.nuvio.tv.ui.screens.player.audiosync.AudioSyncSettings
+import com.nuvio.tv.ui.screens.player.audiosync.AudioSyncTaps
+import com.nuvio.tv.ui.screens.player.seekpreview.local.LocalPreviewSources
+import java.io.File
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.update
+
+/** Thin TV adapter around the feature-owned Mobile AutoSync V2 pipeline. */
+
+/**
+ * Shows an AutoSync message in the glass bubble when it is on and the player is showing, else as
+ * a plain toast. [kind] tells the bubble whether the run is still working or how it ended.
+ */
+private fun PlayerRuntimeController.showAutoSyncToast(
+    kind: AutoSyncBubbleKind,
+    message: String,
+    duration: Int = Toast.LENGTH_SHORT,
+) {
+    showAutoSyncMessage(context, kind, message, duration)
+}
+/**
+ * Clears the subtitle delay once AutoSync has retimed the subtitle, like Nuvio's
+ * `setSubtitleDelayMs(0, showOverlay = false)` but without bringing up the player controls:
+ * AutoSync finishes on its own, so nothing on screen should change except its message.
+ */
+internal fun PlayerRuntimeController.resetSubtitleDelayForAutoSync() {
+    hideSubtitleDelayOverlayJob?.cancel()
+    hideSubtitleDelayOverlayJob = null
+    subtitleDelayUs.set(0L)
+    if (isUsingMpvEngine()) mpvView?.setSubtitleDelayMs(0)
+    _uiState.update { it.copy(subtitleDelayMs = 0, showSubtitleDelayOverlay = false) }
+    refreshActiveSubtitleTrackAfterTimingChange()
+    persistTrackPreference()
+}
+
+/**
+ * Wraps Nuvio's extractors so AutoSync can observe embedded subtitle timing (output is forwarded
+ * unchanged), and starts AutoSync's embedded subtitle index download while the stream opens.
+ */
+internal fun PlayerRuntimeController.autoSyncExtractorsFactory(
+    delegate: ExtractorsFactory,
+    url: String,
+    headers: Map<String, String>,
+): ExtractorsFactory {
+    // Audio is copied too, for the audio sync fallback (idle unless it is listening).
+    // Video keyframes are copied too, for on-device seek previews (idle once all are made).
+    val tapped = LocalPreviewSources.register(
+        owner = this,
+        context = context,
+        sourceKey = url,
+        factory = AudioSyncTaps.wrapExtractors(delegate, url),
+        headers = headers, // Preview-owned range requests use the same stream credentials.
+    )
+    AutoSyncPreferences.ensureLoaded(context)
+    if (!AutoSyncPreferences.isEnabled(context)) return tapped
+    val factory = AutoSyncExtractorsFactory(delegate = tapped, sourceKey = url)
+    prefetchAutoSyncIndex(url, headers)
+    return factory
+}
+
+/**
+ * Starts the embedded subtitle index download while the stream opens, so a later AutoSync run
+ * finds it cached or joins the in-flight load instead of starting when a subtitle is selected.
+ */
+internal fun PlayerRuntimeController.prefetchAutoSyncIndex(
+    url: String,
+    headers: Map<String, String>,
+) {
+    // A live channel has no subtitle index, and a second connection can take its provider's only slot.
+    if (com.nuvio.tv.reshaped.livetv.LiveTvPlaybackRegistry.isLiveTv(url)) return
+    AutoSyncPreferences.ensureLoaded(context)
+    if (!AutoSyncPreferences.isEnabled(context)) return
+    EmbeddedSubtitleTimelineLoader.prefetch(scope, url, headers)
+}
+
+/** The user picked [subtitle]: check only that subtitle, never swap in another one. */
+internal fun PlayerRuntimeController.runSelectedAutomaticSubtitleSync(subtitle: Subtitle) =
+    maybeRunAutomaticSubtitleSync(subtitle, AutoSyncCandidateScope.SELECTED_ONLY)
+
+internal fun PlayerRuntimeController.cancelAutomaticSubtitleSync() {
+    automaticSubtitleSyncJob?.cancel()
+    automaticSubtitleSyncJob = null
+    AudioSyncFallback.release(this)
+}
+
+/** The user left the add-on subtitle: stop working on it, keeping the audio sync for later. */
+internal fun PlayerRuntimeController.stopAutomaticSubtitleSync() {
+    automaticSubtitleSyncJob?.cancel()
+    automaticSubtitleSyncJob = null
+    AudioSyncFallback.stop(this)
+}
+
+internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
+    selectedSubtitle: Subtitle,
+    candidateScope: AutoSyncCandidateScope = AutoSyncCandidateScope.STARTUP_SEARCH,
+) {
+    AutoSyncPreferences.ensureLoaded(context)
+    if (!AutoSyncPreferences.isEnabled(context)) return
+    if (selectedSubtitle.lang.isBlank()) return
+    if (!currentStreamUrl.startsWith("http://", ignoreCase = true) &&
+        !currentStreamUrl.startsWith("https://", ignoreCase = true)
+    ) {
+        return
+    }
+    if (
+        candidateScope == AutoSyncCandidateScope.STARTUP_SEARCH &&
+        !AutoSyncPreferences.claimStartupRun(hashCode(), currentStreamUrl)
+    ) {
+        return
+    }
+    if (isUsingMpvEngine()) {
+        runMpvAutomaticSubtitleSync(selectedSubtitle, candidateScope)
+        return
+    }
+
+    val player = _exoPlayer ?: return
+    val useLibass = requestedUseLibassByUser || activePlayerUsesLibass
+
+    AutoSyncBubbleToasts.beginRun()
+    showAutoSyncToast(AutoSyncBubbleKind.Working, context.getString(R.string.autosync_toast_analyzing))
+
+    // ASS/SSA stays on libass's own path so its styling is kept; the result is applied there.
+    if (useLibass && isLibassAddonSubtitle(selectedSubtitle)) {
+        runLibassAutomaticSubtitleSync(selectedSubtitle, candidateScope)
+        return
+    }
+
+    if (!canAttachAddonSubtitleViaSidecar(selectedSubtitle)) {
+        showAutoSyncToast(AutoSyncBubbleKind.Failure, context.getString(R.string.reshaped_autosync_toast_failed_unsupported))
+        return
+    }
+
+    automaticSubtitleSyncJob?.cancel()
+
+    val sourceUrlAtStart = currentStreamUrl
+    // The user chose this subtitle (or it was restored from their choice), rather than Nuvio's
+    // automatic selection picking it.
+    val userChosenAtStart = isUserExplicitSubtitleSelection
+    val sourceHeadersAtStart = currentHeaders.toMap()
+    val selectedUrl = selectedSubtitle.url
+    val candidatesAtStart = (_uiState.value.addonSubtitles + selectedSubtitle)
+        .distinctBy { it.url }
+    val candidateByUrl = candidatesAtStart.associateBy { it.url }
+
+    // One download feeds both the sidecar renderer and the analysis. It completes with null
+    // on failure or cancellation so neither side can wait on it forever.
+    val selectedBodyDeferred = CompletableDeferred<String?>()
+    val started = startSidecarAddonSubtitle(
+        subtitle = selectedSubtitle,
+        rawBodyLoader = {
+            selectedBodyDeferred.await()
+                ?: throw IllegalStateException("Subtitle body unavailable")
+        },
+    )
+    if (!started) {
+        showAutoSyncToast(AutoSyncBubbleKind.Failure, context.getString(R.string.reshaped_autosync_toast_failed))
+        return
+    }
+
+    player.trackSelectionParameters = player.trackSelectionParameters
+        .buildUpon()
+        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+        .build()
+    val audioFallback = AudioSyncFallback.of(this)
+    val audioSyncTakesOver = audioFallback != null && AudioSyncSettings.fallbackEnabled.value
+    // As on the phone, a subtitle file that never fits the audio may give way to one in the same
+    // language that does, even when the user picked it.
+    audioFallback?.arm()
+
+    automaticSubtitleSyncJob = scope.launch {
+        launch {
+            val body = try {
+                AutomaticSubtitleSync.downloadSubtitleBody(
+                    url = selectedUrl,
+                    headers = selectedSubtitle.headers.orEmpty(),
+                    languageHint = selectedSubtitle.lang,
+                )
+            } catch (cancel: CancellationException) {
+                throw cancel
+            } catch (error: Exception) {
+                Log.w(PlayerRuntimeController.TAG, "AUTO_SYNC_V2 subtitle download failed", error)
+                null
+            }
+            selectedBodyDeferred.complete(body)
+        }
+        // The user can switch to a built-in track, turn subtitles off or open another stream while
+        // this runs; the fallbacks below must then leave their choice alone.
+        fun stillRelevant(): Boolean =
+            currentStreamUrl == sourceUrlAtStart &&
+                _uiState.value.selectedAddonSubtitle?.url == selectedUrl
+
+        try {
+            Log.d(
+                PlayerRuntimeController.TAG,
+                "AUTO_SYNC_V2 start scope=${candidateScope.name} " +
+                    "lang=${selectedSubtitle.lang} candidates=${candidatesAtStart.size}",
+            )
+            var analysisOutcome: AutoSyncAnalysisOutcome? = null
+            var searchResult = AutomaticSubtitleSync.findTimelineRetime(
+                sourceKey = sourceUrlAtStart,
+                sourceHeaders = sourceHeadersAtStart,
+                selectedSubtitleUrl = selectedUrl,
+                selectedSubtitleHeaders = selectedSubtitle.headers.orEmpty(),
+                selectedSubtitleBodyDeferred = selectedBodyDeferred,
+                preferredLanguage = selectedSubtitle.lang,
+                alternativeSubtitles = if (candidateScope == AutoSyncCandidateScope.STARTUP_SEARCH) {
+                    candidatesAtStart.map { it.toAutoSyncCandidate() }
+                } else {
+                    emptyList()
+                },
+                alternativeSubtitlesProvider = if (
+                    candidateScope == AutoSyncCandidateScope.STARTUP_SEARCH
+                ) {
+                    { _uiState.value.addonSubtitles.map { it.toAutoSyncCandidate() } }
+                } else {
+                    null
+                },
+                onReferenceReady = {},
+                onAnalysisOutcome = { outcome -> analysisOutcome = outcome },
+                streamHasTextTracks = ::streamHasTextTracks,
+                // With the audio sync on, an index without subtitle cues hands over to it at once,
+                // as on the phone, instead of waiting up to a minute for a delay-only sample.
+                sparseLiveReferenceAllowed = !audioSyncTakesOver,
+            )
+
+            // No match in the first language: search the secondary subtitle language before the
+            // audio fallback. Only at startup, only when a subtitle could still match (not when
+            // there is no reference), and never over a subtitle the user picked themselves.
+            val secondarySeed =
+                if (
+                    searchResult == null &&
+                    candidateScope == AutoSyncCandidateScope.STARTUP_SEARCH &&
+                    (
+                        analysisOutcome == null ||
+                            analysisOutcome == AutoSyncAnalysisOutcome.SUBTITLE_UNAVAILABLE ||
+                            analysisOutcome == AutoSyncAnalysisOutcome.NO_FIT ||
+                            analysisOutcome == AutoSyncAnalysisOutcome.INCONCLUSIVE
+                        ) &&
+                    stillRelevant()
+                ) {
+                    secondaryLanguageSearchSeed(
+                        candidates = candidatesAtStart.map { it.toAutoSyncCandidate() },
+                        selectedUrl = selectedUrl,
+                        searchedLanguage = selectedSubtitle.lang,
+                        secondaryLanguage = _uiState.value.subtitleStyle.secondaryPreferredLanguage,
+                    )
+                } else {
+                    null
+                }
+            if (secondarySeed != null) {
+                // The fallback and failure toast below should reflect this attempt, not the first.
+                analysisOutcome = null
+                searchResult = AutomaticSubtitleSync.findTimelineRetime(
+                    sourceKey = sourceUrlAtStart,
+                    sourceHeaders = sourceHeadersAtStart,
+                    selectedSubtitleUrl = secondarySeed.url,
+                    selectedSubtitleHeaders = candidateByUrl[secondarySeed.url]?.headers.orEmpty(),
+                    preferredLanguage = secondarySeed.language,
+                    alternativeSubtitles = candidatesAtStart.map { it.toAutoSyncCandidate() },
+                    alternativeSubtitlesProvider = {
+                        _uiState.value.addonSubtitles.map { it.toAutoSyncCandidate() }
+                    },
+                    continueDebugSession = true,
+                    onAnalysisOutcome = { outcome -> analysisOutcome = outcome },
+                    sparseLiveReferenceAllowed = !audioSyncTakesOver,
+                )
+                val matched = searchResult != null
+                AutoSyncDebugLog.info {
+                    "secondaryLanguage=${secondarySeed.language} matched=$matched"
+                }
+            }
+            val resolved = searchResult
+
+            if (resolved == null) {
+                if (!stillRelevant()) {
+                    audioFallback?.disarm()
+                    AutoSyncDebugLog.finishAndCopy(context, "REJECT V2 - user left the subtitle")
+                    return@launch
+                }
+                if (activeSidecarSubtitleKey == null) {
+                    startSidecarAddonSubtitle(selectedSubtitle)
+                }
+                // Original timing kept: sync it to the audio instead, when AutoSync found nothing
+                // to align to or only a weak match (not when the subtitle itself failed to load).
+                val audioTakesOver =
+                    if (analysisOutcome != AutoSyncAnalysisOutcome.SUBTITLE_UNAVAILABLE && currentStreamUrl == sourceUrlAtStart) {
+                        audioFallback?.takeOver(selectedUrl) == true
+                    } else {
+                        audioFallback?.disarm()
+                        false
+                    }
+                AutoSyncDebugLog.finishAndCopy(
+                    context,
+                    "REJECT V2 - original subtitle timing kept",
+                )
+                showAutoSyncToast(
+                    if (audioTakesOver) AutoSyncBubbleKind.Working else AutoSyncBubbleKind.Failure,
+                    if (audioTakesOver) {
+                        context.getString(R.string.autosync_toast_failed_audio_fallback)
+                    } else {
+                        context.buildAutoSyncFailureToast(analysisOutcome)
+                    },
+                )
+                return@launch
+            }
+
+            audioFallback?.disarm()
+            if (currentStreamUrl != sourceUrlAtStart) return@launch
+            val activeSubtitleUrl = _uiState.value.selectedAddonSubtitle?.url
+            if (activeSubtitleUrl != selectedUrl && activeSubtitleUrl != resolved.subtitleUrl) {
+                return@launch
+            }
+
+            val chosenSubtitle = candidateByUrl[resolved.subtitleUrl]
+                ?: _uiState.value.addonSubtitles.firstOrNull { it.url == resolved.subtitleUrl }
+                ?: selectedSubtitle.takeIf { it.url == resolved.subtitleUrl }
+                ?: return@launch
+
+            // A confident match whose whole-film correction is within the user's tolerance keeps
+            // the selected subtitle's original timing instead of retiming it.
+            val toleranceMs = AutoSyncPreferences.syncToleranceMs.value
+            val withinToleranceMs = toleranceMs.takeIf {
+                it > 0 &&
+                    resolved.subtitleUrl == selectedUrl &&
+                    resolved.timeline.maxAlignmentShiftMs() <= it
+            }
+            val applied = when {
+                withinToleranceMs != null -> activeSidecarSubtitleKey == selectedUrl
+                resolved.subtitleUrl == selectedUrl -> {
+                    applyAutoSyncSidecarTimeline(
+                        sidecar = this@maybeRunAutomaticSubtitleSync,
+                        url = selectedUrl,
+                        timeline = resolved.timeline,
+                    )
+                }
+                activeSidecarSubtitleKey == null &&
+                    startSidecarAddonSubtitle(
+                        subtitle = chosenSubtitle,
+                        rawBodyLoader = resolved.subtitleBody?.let { body ->
+                            suspend { body }
+                        },
+                    ) -> {
+                    applyAutoSyncSidecarTimeline(
+                        sidecar = this@maybeRunAutomaticSubtitleSync,
+                        url = resolved.subtitleUrl,
+                        timeline = resolved.timeline,
+                    )
+                }
+                else -> {
+                    replaceAutoSyncSidecarSubtitle(
+                        sidecar = this@maybeRunAutomaticSubtitleSync,
+                        expectedCurrentUrl = selectedUrl,
+                        url = resolved.subtitleUrl,
+                        headers = resolved.subtitleHeaders,
+                        rawBody = resolved.subtitleBody,
+                        useLibass = useLibass,
+                        timeline = resolved.timeline,
+                    )
+                }
+            }
+
+            if (!applied) {
+                if (!stillRelevant()) {
+                    AutoSyncDebugLog.finishAndCopy(context, "REJECT V2 - user left the subtitle")
+                    return@launch
+                }
+                if (activeSidecarSubtitleKey == null) {
+                    startSidecarAddonSubtitle(selectedSubtitle)
+                }
+                AutoSyncDebugLog.finishAndCopy(
+                    context,
+                    "REJECT V2 - sidecar changed or apply failed",
+                )
+                showAutoSyncToast(AutoSyncBubbleKind.Failure, context.getString(R.string.reshaped_autosync_toast_failed))
+                return@launch
+            }
+
+            if (chosenSubtitle.url != selectedUrl) {
+                _uiState.update {
+                    it.copy(
+                        selectedAddonSubtitle = chosenSubtitle,
+                        selectedSubtitleTrackIndex = -1,
+                    )
+                }
+                // Only a subtitle the user chose is saved: saving an automatic pick would make the
+                // next playback restore an add-on subtitle over Nuvio's built-in track selection.
+                // A secondary-language fallback is never saved either, so the next episode still
+                // starts from the first language.
+                val switchedLanguage = selectedSubtitle.lang.isNotBlank() &&
+                    chosenSubtitle.lang.isNotBlank() &&
+                    !SubtitleLanguageMatching.matchesLanguageCode(chosenSubtitle.lang, selectedSubtitle.lang)
+                if (userChosenAtStart && !switchedLanguage) {
+                    rememberAddonSubtitleSelection(chosenSubtitle)
+                }
+            }
+            if (!resolved.reused) resetSubtitleDelayForAutoSync()
+            AutoSyncSyncedSubtitle.mark(chosenSubtitle.url)
+
+            val timeline = resolved.timeline
+            AutoSyncDebugLog.info {
+                "AUTO APPLY V2 sidecar=true bufferPreserved=true " +
+                    "externalChanged=${chosenSubtitle.url != selectedUrl} " +
+                    "groups=${timeline.groups.size} alignment=${timeline.alignmentSource} " +
+                    "targetCoverage=${"%.4f".format(timeline.targetCoverage)} " +
+                    "referenceCoverage=${"%.4f".format(timeline.referenceCoverage)} " +
+                    "maxShift=${"%.1f".format(timeline.maxAlignmentShiftMs())}ms " +
+                    "withinTolerance=${withinToleranceMs != null} toleranceMs=$toleranceMs"
+            }
+            AutoSyncDebugLog.finishAndCopy(
+                context,
+                if (withinToleranceMs != null) {
+                    "WITHIN TOLERANCE ${withinToleranceMs}ms - original timing kept url=${chosenSubtitle.url}"
+                } else {
+                    "APPLIED V2 sidecar timeline url=${chosenSubtitle.url}"
+                },
+            )
+            showAutoSyncToast(
+                AutoSyncBubbleKind.Success,
+                context.getString(
+                    when {
+                        chosenSubtitle.url != selectedUrl -> R.string.autosync_toast_synced_replaced
+                        withinToleranceMs != null -> R.string.autosync_toast_in_sync
+                        else -> R.string.autosync_toast_synced
+                    },
+                ),
+            )
+        } catch (cancel: CancellationException) {
+            throw cancel
+        } catch (error: Throwable) {
+            Log.w(PlayerRuntimeController.TAG, "AUTO_SYNC_V2 failed", error)
+            AutoSyncDebugLog.error(error) { "TV bridge failed" }
+            audioFallback?.disarm()
+            AutoSyncDebugLog.finishAndCopy(context, "failed")
+            if (!stillRelevant()) return@launch
+            if (activeSidecarSubtitleKey == null) {
+                startSidecarAddonSubtitle(selectedSubtitle)
+            }
+            showAutoSyncToast(AutoSyncBubbleKind.Failure, context.getString(R.string.reshaped_autosync_toast_failed))
+        }
+    }.also { job ->
+        job.invokeOnCompletion { selectedBodyDeferred.complete(null) }
+    }
+}
+
+/**
+ * Whether the playing stream lists any text track (embedded, or attached by Nuvio), from the
+ * player's own track list; null until the player has read it. AutoSync stops waiting for embedded
+ * cues when this is false, so a file without subtitles goes to the audio sync straight away even
+ * when the subtitle index could not be read.
+ */
+private suspend fun PlayerRuntimeController.streamHasTextTracks(): Boolean? =
+    withContext(Dispatchers.Main.immediate) {
+        val player = _exoPlayer ?: return@withContext null
+        val tracks = player.currentTracks
+        if (tracks.isEmpty) return@withContext null
+        tracks.groups.any { it.type == C.TRACK_TYPE_TEXT }
+    }
+
+/**
+ * mpv path. mpv exposes no embedded subtitle timing while it plays, so only the container's own
+ * subtitle index can serve as the reference. The result is applied by loading a copy of the
+ * subtitle whose timestamps are rewritten, which mpv shows in place of the original track.
+ */
+private fun PlayerRuntimeController.runMpvAutomaticSubtitleSync(
+    selectedSubtitle: Subtitle,
+    candidateScope: AutoSyncCandidateScope,
+) {
+    stopAutomaticSubtitleSync()
+    showAutoSyncToast(AutoSyncBubbleKind.Working, context.getString(R.string.autosync_toast_analyzing))
+
+    val sourceUrlAtStart = currentStreamUrl
+    val sourceHeadersAtStart = currentHeaders.toMap()
+    val selectedUrl = selectedSubtitle.url
+    val candidatesAtStart = (_uiState.value.addonSubtitles + selectedSubtitle)
+        .distinctBy { it.url }
+    val candidateByUrl = candidatesAtStart.associateBy { it.url }
+
+    automaticSubtitleSyncJob = scope.launch {
+        fun streamUnchanged(): Boolean =
+            currentStreamUrl == sourceUrlAtStart && isUsingMpvEngine()
+
+        try {
+            Log.d(
+                PlayerRuntimeController.TAG,
+                "AUTO_SYNC_V2 mpv start scope=${candidateScope.name} " +
+                    "lang=${selectedSubtitle.lang} candidates=${candidatesAtStart.size}",
+            )
+            var analysisOutcome: AutoSyncAnalysisOutcome? = null
+            val resolved = AutomaticSubtitleSync.findTimelineRetime(
+                sourceKey = sourceUrlAtStart,
+                sourceHeaders = sourceHeadersAtStart,
+                selectedSubtitleUrl = selectedUrl,
+                selectedSubtitleHeaders = selectedSubtitle.headers.orEmpty(),
+                preferredLanguage = selectedSubtitle.lang,
+                alternativeSubtitles = if (candidateScope == AutoSyncCandidateScope.STARTUP_SEARCH) {
+                    candidatesAtStart.map { it.toAutoSyncCandidate() }
+                } else {
+                    emptyList()
+                },
+                alternativeSubtitlesProvider = if (
+                    candidateScope == AutoSyncCandidateScope.STARTUP_SEARCH
+                ) {
+                    { _uiState.value.addonSubtitles.map { it.toAutoSyncCandidate() } }
+                } else {
+                    null
+                },
+                onAnalysisOutcome = { outcome -> analysisOutcome = outcome },
+                allowLiveReference = false,
+            )
+
+            // The plain selection loads the original file; let it land so it cannot replace
+            // the synced copy afterwards.
+            mpvAddonSubtitleSelectionJob?.join()
+            if (!streamUnchanged()) return@launch
+            val activeSubtitleUrl = _uiState.value.selectedAddonSubtitle?.url
+            if (resolved == null) {
+                Log.d(PlayerRuntimeController.TAG, "AUTO_SYNC_V2 mpv no match outcome=$analysisOutcome")
+                if (activeSubtitleUrl == selectedUrl) {
+                    showAutoSyncToast(AutoSyncBubbleKind.Failure, context.buildAutoSyncFailureToast(analysisOutcome))
+                }
+                return@launch
+            }
+            if (activeSubtitleUrl != selectedUrl && activeSubtitleUrl != resolved.subtitleUrl) {
+                return@launch
+            }
+
+            val chosenSubtitle = candidateByUrl[resolved.subtitleUrl]
+                ?: _uiState.value.addonSubtitles.firstOrNull { it.url == resolved.subtitleUrl }
+                ?: return@launch
+
+            // A confident match whose whole-film correction is within the user's tolerance keeps
+            // the selected subtitle's original timing instead of retiming it.
+            val toleranceMs = AutoSyncPreferences.syncToleranceMs.value
+            val withinTolerance = toleranceMs > 0 &&
+                resolved.subtitleUrl == selectedUrl &&
+                resolved.timeline.maxAlignmentShiftMs() <= toleranceMs
+            if (!withinTolerance) {
+                val path = writeMpvAutoSyncedSubtitle(chosenSubtitle, resolved)
+                if (!streamUnchanged() || _uiState.value.selectedAddonSubtitle?.url != activeSubtitleUrl) {
+                    return@launch
+                }
+                val wasPlaying = isPlaybackCurrentlyPlaying()
+                val added = path != null && mpvView?.addAndSelectExternalSubtitle(
+                    url = path,
+                    title = buildAddonSubtitleTrackId(chosenSubtitle),
+                    language = PlayerSubtitleUtils.normalizeLanguageCode(chosenSubtitle.lang),
+                ) == true
+                if (!added) {
+                    showAutoSyncToast(AutoSyncBubbleKind.Failure, context.getString(R.string.reshaped_autosync_toast_failed))
+                    return@launch
+                }
+                keepMpvPlayingIfNeeded(wasPlaying)
+            }
+
+            if (chosenSubtitle.url != selectedUrl) {
+                _uiState.update {
+                    it.copy(
+                        selectedAddonSubtitle = chosenSubtitle,
+                        selectedSubtitleTrackIndex = -1,
+                    )
+                }
+                rememberAddonSubtitleSelection(chosenSubtitle)
+            }
+            if (!withinTolerance) updateMpvAvailableTracks()
+            if (!resolved.reused) resetSubtitleDelayForAutoSync()
+            AutoSyncSyncedSubtitle.mark(chosenSubtitle.url)
+            showAutoSyncToast(
+                AutoSyncBubbleKind.Success,
+                context.getString(
+                    when {
+                        chosenSubtitle.url != selectedUrl -> R.string.autosync_toast_synced_replaced
+                        withinTolerance -> R.string.autosync_toast_in_sync
+                        else -> R.string.autosync_toast_synced
+                    },
+                ),
+            )
+            Log.d(
+                PlayerRuntimeController.TAG,
+                "AUTO_SYNC_V2 mpv applied id=${chosenSubtitle.id} " +
+                    "switched=${chosenSubtitle.url != selectedUrl} keptTiming=$withinTolerance " +
+                    "source=${resolved.timeline.alignmentSource} " +
+                    "scale=${resolved.timeline.alignmentScale} " +
+                    "interceptMs=${resolved.timeline.alignmentInterceptMs.toLong()}",
+            )
+        } catch (cancel: CancellationException) {
+            throw cancel
+        } catch (error: Throwable) {
+            Log.w(PlayerRuntimeController.TAG, "AUTO_SYNC_V2 mpv failed", error)
+            if (streamUnchanged() && _uiState.value.selectedAddonSubtitle?.url == selectedUrl) {
+                showAutoSyncToast(AutoSyncBubbleKind.Failure, context.getString(R.string.reshaped_autosync_toast_failed))
+            }
+        }
+    }
+}
+
+private fun PlayerRuntimeController.isLibassAddonSubtitle(subtitle: Subtitle): Boolean =
+    PlayerSubtitleUtils.mimeTypeFromUrl(subtitle.url) == MimeTypes.TEXT_SSA &&
+        _exoPlayer?.getAssHandlerCompat() != null
+
+/**
+ * ExoPlayer path for ASS/SSA add-on subtitles drawn by libass. The analysis is the same as for the
+ * sidecar renderer, while libass keeps showing the original. A confident result is applied by
+ * loading a copy of the subtitle whose timestamps are rewritten into libass's track for it
+ * ([AutoSyncLibassSubtitles]), so styling is kept and the media source is not reloaded.
+ *
+ * The startup search tries ASS/SSA candidates first, so the styling is kept whenever one fits.
+ * Only when none does are the other formats tried, and a fitting SRT/VTT is shown by the sidecar
+ * renderer: a synced subtitle without styling beats a styled one that is out of sync.
+ */
+private fun PlayerRuntimeController.runLibassAutomaticSubtitleSync(
+    selectedSubtitle: Subtitle,
+    candidateScope: AutoSyncCandidateScope,
+) {
+    automaticSubtitleSyncJob?.cancel()
+    val player = _exoPlayer ?: return
+
+    val userChosenAtStart = isUserExplicitSubtitleSelection
+    val sourceUrlAtStart = currentStreamUrl
+    val sourceHeadersAtStart = currentHeaders.toMap()
+    val selectedUrl = selectedSubtitle.url
+    fun Subtitle.isAss() = PlayerSubtitleUtils.mimeTypeFromUrl(url) == MimeTypes.TEXT_SSA
+    val candidatesAtStart = (_uiState.value.addonSubtitles + selectedSubtitle)
+        .distinctBy { it.url }
+    val candidateByUrl = candidatesAtStart.associateBy { it.url }
+
+    automaticSubtitleSyncJob = scope.launch {
+        fun streamUnchanged(): Boolean =
+            currentStreamUrl == sourceUrlAtStart && _exoPlayer === player && !isUsingMpvEngine()
+
+        fun stillRelevant(): Boolean =
+            streamUnchanged() && _uiState.value.selectedAddonSubtitle?.url == selectedUrl
+
+        try {
+            Log.d(
+                PlayerRuntimeController.TAG,
+                "AUTO_SYNC_V2 libass start scope=${candidateScope.name} " +
+                    "lang=${selectedSubtitle.lang} candidates=${candidatesAtStart.size}",
+            )
+            var analysisOutcome: AutoSyncAnalysisOutcome? = null
+            val startupSearch = candidateScope == AutoSyncCandidateScope.STARTUP_SEARCH
+            suspend fun search(ass: Boolean) = AutomaticSubtitleSync.findTimelineRetime(
+                sourceKey = sourceUrlAtStart,
+                sourceHeaders = sourceHeadersAtStart,
+                selectedSubtitleUrl = selectedUrl,
+                selectedSubtitleHeaders = selectedSubtitle.headers.orEmpty(),
+                preferredLanguage = selectedSubtitle.lang,
+                alternativeSubtitles = if (startupSearch) {
+                    candidatesAtStart.filter { it.isAss() == ass }.map { it.toAutoSyncCandidate() }
+                } else {
+                    emptyList()
+                },
+                alternativeSubtitlesProvider = if (startupSearch) {
+                    {
+                        _uiState.value.addonSubtitles
+                            .filter { it.isAss() == ass }
+                            .map { it.toAutoSyncCandidate() }
+                    }
+                } else {
+                    null
+                },
+                onAnalysisOutcome = { outcome -> analysisOutcome = outcome },
+            )
+            var resolved = search(ass = true)
+            // No ASS/SSA fits: try the other formats, unless the video has nothing to compare with.
+            if (
+                resolved == null && startupSearch && streamUnchanged() &&
+                analysisOutcome != AutoSyncAnalysisOutcome.NO_SUBTITLE_TRACKS &&
+                analysisOutcome != AutoSyncAnalysisOutcome.NO_USABLE_REFERENCE &&
+                _uiState.value.addonSubtitles.any { !it.isAss() }
+            ) {
+                resolved = search(ass = false)
+            }
+
+            if (!streamUnchanged()) return@launch
+            val activeSubtitleUrl = _uiState.value.selectedAddonSubtitle?.url
+            if (resolved == null) {
+                Log.d(PlayerRuntimeController.TAG, "AUTO_SYNC_V2 libass no match outcome=$analysisOutcome")
+                if (activeSubtitleUrl == selectedUrl) {
+                    showAutoSyncToast(AutoSyncBubbleKind.Failure, context.buildAutoSyncFailureToast(analysisOutcome))
+                }
+                return@launch
+            }
+            if (activeSubtitleUrl != selectedUrl && activeSubtitleUrl != resolved.subtitleUrl) {
+                return@launch
+            }
+
+            val chosenSubtitle = candidateByUrl[resolved.subtitleUrl]
+                ?: _uiState.value.addonSubtitles.firstOrNull { it.url == resolved.subtitleUrl }
+                ?: return@launch
+
+            // A confident match whose whole-film correction is within the user's tolerance keeps
+            // the selected subtitle's original timing instead of retiming it.
+            val toleranceMs = AutoSyncPreferences.syncToleranceMs.value
+            val withinTolerance = toleranceMs > 0 &&
+                resolved.subtitleUrl == selectedUrl &&
+                resolved.timeline.maxAlignmentShiftMs() <= toleranceMs
+            val applied = withinTolerance || applyLibassAutoSyncResult(
+                player = player,
+                selectedSubtitle = selectedSubtitle,
+                chosenSubtitle = chosenSubtitle,
+                resolved = resolved,
+                stillApplicable = {
+                    streamUnchanged() &&
+                        _uiState.value.selectedAddonSubtitle?.url.let {
+                            it == selectedUrl || it == chosenSubtitle.url
+                        }
+                },
+            )
+            if (!applied) {
+                return@launch
+            }
+
+            if (chosenSubtitle.url != selectedUrl) {
+                _uiState.update {
+                    it.copy(
+                        selectedAddonSubtitle = chosenSubtitle,
+                        selectedSubtitleTrackIndex = -1,
+                    )
+                }
+                if (userChosenAtStart && SubtitleLanguageMatching.matchesLanguageCode(chosenSubtitle.lang, selectedSubtitle.lang)) {
+                    rememberAddonSubtitleSelection(chosenSubtitle)
+                }
+            }
+            if (!resolved.reused) resetSubtitleDelayForAutoSync()
+            AutoSyncSyncedSubtitle.mark(chosenSubtitle.url)
+            showAutoSyncToast(AutoSyncBubbleKind.Success, context.getString(R.string.autosync_toast_synced))
+            Log.d(
+                PlayerRuntimeController.TAG,
+                "AUTO_SYNC_V2 libass applied id=${chosenSubtitle.id} " +
+                    "switched=${chosenSubtitle.url != selectedUrl} keptTiming=$withinTolerance " +
+                    "source=${resolved.timeline.alignmentSource} " +
+                    "scale=${resolved.timeline.alignmentScale} " +
+                    "interceptMs=${resolved.timeline.alignmentInterceptMs.toLong()}",
+            )
+        } catch (cancel: CancellationException) {
+            throw cancel
+        } catch (error: Throwable) {
+            Log.w(PlayerRuntimeController.TAG, "AUTO_SYNC_V2 libass failed", error)
+            if (stillRelevant()) showAutoSyncToast(AutoSyncBubbleKind.Failure, context.getString(R.string.reshaped_autosync_toast_failed))
+        }
+    }
+}
+
+/**
+ * Applies [resolved] for the libass path. An ASS/SSA result is retimed as text and loaded into
+ * libass's track, after Nuvio's own switch when AutoSync picked another ASS file. An SRT/VTT result
+ * (no ASS/SSA fitted) is shown by the sidecar renderer and retimed there; if that fails, the
+ * selected ASS subtitle is put back, so the viewer is never left without a subtitle.
+ */
+private suspend fun PlayerRuntimeController.applyLibassAutoSyncResult(
+    player: ExoPlayer,
+    selectedSubtitle: Subtitle,
+    chosenSubtitle: Subtitle,
+    resolved: AutoSyncResolvedTimeline,
+    stillApplicable: () -> Boolean,
+): Boolean {
+    val selectedUrl = selectedSubtitle.url
+    if (PlayerSubtitleUtils.mimeTypeFromUrl(chosenSubtitle.url) != MimeTypes.TEXT_SSA) {
+        if (!canAttachAddonSubtitleViaSidecar(chosenSubtitle) || !stillApplicable()) return false
+        disableSubtitles()
+        pendingAddonSubtitleLanguage = null
+        pendingAddonSubtitleTrackId = null
+        pendingAudioSelectionAfterSubtitleRefresh = null
+        val applied = startSidecarAddonSubtitle(
+            subtitle = chosenSubtitle,
+            rawBodyLoader = resolved.subtitleBody?.let { body -> suspend { body } },
+        ) && applyAutoSyncSidecarTimeline(
+            sidecar = this,
+            url = chosenSubtitle.url,
+            timeline = resolved.timeline,
+        )
+        if (!applied) {
+            stopSidecarAddonSubtitle()
+            selectAddonSubtitle(selectedSubtitle)
+        }
+        return applied
+    }
+
+    val assHandler = player.getAssHandlerCompat() ?: return false
+    val body = resolved.subtitleBody
+        ?: downloadSubtitleBody(chosenSubtitle.url, chosenSubtitle.lang, chosenSubtitle.headers)
+    val retimed = withContext(AutomaticSubtitleSync.autoSyncDispatcher) {
+        AutoSyncSubtitleTextRetimer.retime(
+            body = SubtitleMojibakeSanitizer.sanitize(body).toString(),
+            timeline = resolved.timeline,
+        )
+    } ?: return false
+    if (!stillApplicable()) return false
+    if (chosenSubtitle.url != selectedUrl) selectAddonSubtitle(chosenSubtitle)
+    AutoSyncLibassSubtitles.apply(
+        assHandler = assHandler,
+        trackId = buildAddonSubtitleTrackId(chosenSubtitle),
+        retimedText = retimed,
+    )
+    return true
+}
+
+/**
+ * Writes [subtitle] with the AutoSync timeline applied next to the plain mpv subtitle cache, and
+ * returns its path, or null when its format cannot be retimed. The name follows the content, so
+ * mpv's `cached` sub-add reuses the track when the same result is applied again.
+ */
+private suspend fun PlayerRuntimeController.writeMpvAutoSyncedSubtitle(
+    subtitle: Subtitle,
+    resolved: AutoSyncResolvedTimeline,
+): String? {
+    val body = resolved.subtitleBody
+        ?: downloadSubtitleBody(subtitle.url, subtitle.lang, subtitle.headers)
+    val retimed = withContext(AutomaticSubtitleSync.autoSyncDispatcher) {
+        AutoSyncSubtitleTextRetimer.retime(
+            body = SubtitleMojibakeSanitizer.sanitize(body).toString(),
+            timeline = resolved.timeline,
+        )
+    } ?: return null
+    return withContext(Dispatchers.IO) {
+        val cacheDir = File(context.cacheDir, "subtitles").also { it.mkdirs() }
+        val prefix = "mpv_autosync_${Integer.toHexString(subtitle.id.hashCode())}_"
+        val extension = when {
+            retimed.trimStart().startsWith("WEBVTT") -> "vtt"
+            retimed.contains("[Events]", ignoreCase = true) -> "ass"
+            else -> "srt"
+        }
+        val file = File(cacheDir, "$prefix${Integer.toHexString(retimed.hashCode())}.$extension")
+        cacheDir.listFiles { candidate -> candidate.name.startsWith(prefix) && candidate != file }
+            ?.forEach { it.delete() }
+        file.writeText(retimed, Charsets.UTF_8)
+        file.absolutePath
+    }
+}
+
+private fun Subtitle.toAutoSyncCandidate() = AutoSyncSubtitleCandidate(
+    url = url,
+    language = lang,
+    name = addonName.ifBlank { id },
+)
+
+/** Why AutoSync kept the original timing, in the fewest words that still help the viewer. */
+private fun Context.buildAutoSyncFailureToast(analysisOutcome: AutoSyncAnalysisOutcome?): String =
+    getString(
+        when (analysisOutcome) {
+            AutoSyncAnalysisOutcome.NO_SUBTITLE_TRACKS,
+            AutoSyncAnalysisOutcome.NO_USABLE_REFERENCE,
+            -> R.string.reshaped_autosync_toast_failed_no_reference
+            AutoSyncAnalysisOutcome.NO_FIT -> R.string.autosync_toast_no_fit
+            AutoSyncAnalysisOutcome.INCONCLUSIVE,
+            AutoSyncAnalysisOutcome.SUBTITLE_UNAVAILABLE,
+            null,
+            -> R.string.reshaped_autosync_toast_failed
+        },
+    )
