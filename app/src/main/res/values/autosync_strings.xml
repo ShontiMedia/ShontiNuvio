@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Subtitle AutoSync strings the fork adds; Nuvio's own AutoSync strings live in strings.xml. -->
 <resources>
-    <!-- Settings (Nuvio Reshaped) -->
+    <!-- Settings (ShontiNuvio) -->
     <string name="autosync_debug_logs_title">Debug Logs for Auto Sync</string>
     <string name="autosync_debug_logs_description">Save a detailed Auto Sync timing report and copy it to the clipboard, for reporting difficult subtitle cases.</string>
 

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Nuvio RS: sound and picture format handling ported from Nuvio Arc. Labels follow Arc's wording. -->
+<!-- ShontiNuvio: sound and picture format handling ported from Nuvio Arc. Labels follow Arc's wording. -->
 <resources>
     <string name="reshaped_formats_output_changed">Audio output changed during recovery. Start playback again.</string>
 

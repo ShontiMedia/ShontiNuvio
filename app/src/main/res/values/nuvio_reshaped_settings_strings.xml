@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="settings_nuvio_reshaped" translatable="false">Nuvio Reshaped</string>
-    <string name="settings_nuvio_reshaped_description">Everything Nuvio Reshaped adds, grouped</string>
+    <string name="settings_nuvio_reshaped" translatable="false">ShontiNuvio</string>
+    <string name="settings_nuvio_reshaped_description">Everything ShontiNuvio adds, grouped</string>
     <string name="settings_nuvio_reshaped_autosync_section">Subtitle AutoSync</string>
     <string name="reshaped_debug_logs_to_phone_title">Send debug logs to phone</string>
     <string name="reshaped_debug_logs_to_phone_description">Show a QR code to download AutoSync and audio sync logs on your phone</string>

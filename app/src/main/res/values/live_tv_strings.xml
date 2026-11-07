@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Nuvio Reshaped: Live TV (IPTV). Kept out of Nuvio's strings.xml so upstream merges stay clean. -->
+    <!-- ShontiNuvio: Live TV (IPTV). Kept out of Nuvio's strings.xml so upstream merges stay clean. -->
     <string name="live_tv_title">Live TV</string>
     <string name="settings_live_tv_title">Live TV</string>
     <string name="settings_live_tv_description">Show Live TV in the menu, for M3U, Xtream and Stalker channel lists</string>
