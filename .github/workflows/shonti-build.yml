@@ -8,7 +8,7 @@ on:
       - '**/*.md'
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: shonti-build-${{ github.ref }}
@@ -64,3 +64,16 @@ jobs:
           path: app/build/outputs/apk/full/debug/app-full-universal-debug.apk
           if-no-files-found: error
           retention-days: 14
+
+      - name: Rename APK
+        if: github.ref == 'refs/heads/main'
+        run: cp app/build/outputs/apk/full/debug/app-full-universal-debug.apk ShontiNuvio-base.apk
+
+      - name: Publish rolling base release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2.0.8
+        with:
+          tag_name: base
+          name: ShontiNuvio (base, rolling test build)
+          prerelease: true
+          files: ShontiNuvio-base.apk
