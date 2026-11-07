@@ -1,0 +1,66 @@
+name: ShontiNuvio Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shonti-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build fullDebug APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Write Shonti build properties
+        run: |
+          {
+            printf '%s\n' 'NUVIO_SUPABASE_URL=https://api.nuvio.tv'
+            printf '%s\n' 'NUVIO_SUPABASE_ANON_KEY=sb_publishable_1Clq8rlTVACkdcZuqr6_AD__xUUC_EN'
+            printf '%s\n' 'NUVIO_SUPABASE_FALLBACK_URL='
+            printf '%s\n' 'AUTOSYNC_FORK=false'
+          } > local.dev.properties
+          touch local.properties
+          echo "---- local.dev.properties ----"; cat local.dev.properties
+
+      - name: Prepare CI signing config
+        run: |
+          keytool -genkeypair -v \
+            -keystore "$RUNNER_TEMP/ci-debug.jks" \
+            -storepass android -alias androiddebugkey -keypass android \
+            -dname "CN=ShontiNuvio,O=ShontiMedia,C=US" \
+            -keyalg RSA -keysize 2048 -validity 10000
+          {
+            echo "NUVIO_RELEASE_STORE_FILE=$RUNNER_TEMP/ci-debug.jks"
+            echo "NUVIO_RELEASE_KEY_ALIAS=androiddebugkey"
+            echo "NUVIO_RELEASE_KEY_PASSWORD=android"
+            echo "NUVIO_RELEASE_STORE_PASSWORD=android"
+          } >> "$GITHUB_ENV"
+
+      - name: Build fullDebug APK
+        run: ./gradlew :app:assembleFullDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShontiNuvio-fullDebug-${{ github.run_number }}
+          path: app/build/outputs/apk/full/debug/app-full-universal-debug.apk
+          if-no-files-found: error
+          retention-days: 14
